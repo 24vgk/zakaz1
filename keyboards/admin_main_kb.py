@@ -1,0 +1,8 @@
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+def admin_main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Загрузить таблицу проблем", callback_data="admin:upload_problems")],
+        [InlineKeyboardButton(text="📊 Статистика проблем", callback_data="admin:stats_problems")],
+        [InlineKeyboardButton(text="👥 Управление администраторами", callback_data="admin:admins")],
+    ])
