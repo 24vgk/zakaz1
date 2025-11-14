@@ -251,43 +251,78 @@ async def problems_stats(session: AsyncSession) -> list[dict]:
 async def get_problems_for_reminder(
     session: AsyncSession,
     today: date,
-) -> List[Tuple[Problem, date, int]]:
+) -> List[Dict[str, Any]]:
     """
-    Возвращает список (problem, due_date, days_left) для напоминаний.
+    Возвращает список словарей для напоминаний.
 
-    Условие:
+    Каждый элемент:
+      {
+          "problem_id": int,
+          "number": int,
+          "title": str,
+          "due_date": date,
+          "days_left": int,
+          "assignees": list[int],
+          "plist_title": str,
+          "plist_code": str,
+      }
+
+    Условия:
       - список не закрыт (ProblemList.is_closed = False)
-      - есть assignee (Telegram ID)
-      - есть due_date (в формате 'YYYY-MM-DD')
-      - статус проблемы: IN_PROGRESS или REPORT_SENT
+      - есть исполнители (assignees_raw не NULL)
+      - есть due_date (строка в формате 'YYYY-MM-DD')
+      - статус: IN_PROGRESS или REPORT_SENT
       - days_left в [0, 1, 2, 3]
     """
     stmt = (
-        select(Problem, ProblemList)
+        select(Problem, ProblemList.title, ProblemList.code)
         .join(ProblemList, Problem.list_id == ProblemList.id)
         .where(
             ProblemList.is_closed.is_(False),
-            Problem.assignee.isnot(None),
+            Problem.assignees_raw.isnot(None),
             Problem.due_date.isnot(None),
-            Problem.status.in_([ProblemStatus.IN_PROGRESS, ProblemStatus.REPORT_SENT]),
+            Problem.status.in_([
+                ProblemStatus.IN_PROGRESS,
+                ProblemStatus.REPORT_SENT,
+            ]),
         )
     )
+
     res = await session.execute(stmt)
-    rows = res.all()
+    rows = res.all()  # [(Problem, title, code), ...]
 
-    out: List[Tuple[Problem, date, int]] = []
+    result: List[Dict[str, Any]] = []
 
-    for prob, plist in rows:
+    for prob, plist_title, plist_code in rows:
+        # разбор due_date
         try:
-            # due_date у тебя String(32) — считаем, что формат YYYY-MM-DD
             d = datetime.strptime(prob.due_date.strip(), "%Y-%m-%d").date()
         except Exception:
-            # если дата кривая — просто пропускаем
+            # кривая дата — пропускаем
             continue
 
         days_left = (d - today).days
-        if 0 <= days_left <= 3:
-            out.append((prob, d, days_left))
+        if not (0 <= days_left <= 3):
+            continue
 
-    return out
+        # здесь ещё есть активная сессия, можно спокойно дернуть prob.assignees
+        assignees = prob.assignees  # свойство из модели (список int)
 
+        if not assignees:
+            # если в итоге пусто — нет, кому напоминать
+            continue
+
+        result.append(
+            {
+                "problem_id": prob.id,
+                "number": prob.number,
+                "title": prob.title,
+                "due_date": d,
+                "days_left": days_left,
+                "assignees": assignees,
+                "plist_title": plist_title,
+                "plist_code": plist_code,
+            }
+        )
+
+    return result
