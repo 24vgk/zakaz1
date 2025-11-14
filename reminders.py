@@ -1,6 +1,6 @@
 # reminders.py
 import asyncio
-from datetime import date
+from datetime import date, datetime
 from typing import Iterable
 
 from aiogram import Bot
@@ -11,47 +11,31 @@ from models import Problem
 
 
 async def send_due_reminders(bot: Bot):
-    """
-    Разовая проверка: на сегодня ищем задачи,
-    по которым нужно напомнить, и шлём сообщения исполнителям.
-    """
     today = date.today()
-
     async with session_scope() as s:
-        items = await get_problems_for_reminder(s, today)
+        items = await get_problems_for_reminder(s, today)  # как раньше: список Problem
 
-    if not items:
-        return
-
-    for prob, due_date, days_left in items:
-        # assignee — это Telegram ID
-        chat_id = prob.assignee
-        if not chat_id:
+    for prob in items:
+        due = datetime.strptime(prob.due_date.strip(), "%Y-%m-%d").date()
+        days_left = (due - today).days
+        if not (0 <= days_left <= 3):
             continue
 
-        # собираем человеческий текст
-        if days_left > 0:
-            days_text = {
-                3: "через 3 дня",
-                2: "через 2 дня",
-                1: "завтра",
-            }.get(days_left, f"через {days_left} дней")
-        else:
-            days_text = "сегодня"
-
-        plist = prob.plist  # связь уже подгружена в get_problems_for_reminder
-
-        text = (
+        plist = prob.plist
+        text_base = (
             f"⏰ Напоминание по задаче #{prob.number} из списка «{plist.title or plist.code}».\n\n"
             f"Описание: {prob.title}\n"
-            f"Срок исполнения: {due_date.strftime('%Y-%m-%d')} ({days_text})."
+            f"Срок исполнения: {due.strftime('%Y-%m-%d')}."
         )
 
-        try:
-            await bot.send_message(chat_id=chat_id, text=text)
-        except Exception:
-            # на всякий случай не роняем шедулер
-            continue
+        for tg_id in prob.assignees:    # 👈 несколько людей
+            try:
+                await bot.send_message(
+                    chat_id=tg_id,
+                    text=text_base,
+                )
+            except Exception:
+                continue
 
 
 async def daily_reminder_worker(bot: Bot):

@@ -19,8 +19,7 @@ async def start_all(msg: Message, event_from_user_role: str | None = None):
         )
     else:
         await msg.answer(START, reply_markup=main_menu())
-        # await msg.answer("Привет! Ваша роль не определена. Обратитесь к администратору.")
 
-# @common_router.message()
-# async def debug_chat_id(message: Message):
-#     await message.answer(f"Chat ID: <code>{message.chat.id}</code>")
+# @common_router.callback_query()
+# async def _dbg_any_cb_global(call: CallbackQuery, event_from_user_role: str | None = None):
+#     await call.answer(f"GLOBAL cb: {call.data} (role={event_from_user_role})", show_alert=True)

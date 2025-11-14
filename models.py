@@ -52,7 +52,8 @@ class Problem(Base):
     list_id: Mapped[int] = mapped_column(ForeignKey("problem_lists.id"))
     number: Mapped[int] = mapped_column(Integer)                              # номер в списке
     title: Mapped[str] = mapped_column(Text)
-    assignee: Mapped[int | None] = mapped_column(BigInteger)                  # TG id
+    # assignee: Mapped[int | None] = mapped_column(BigInteger)                  # TG id
+    assignees_raw: Mapped[str | None] = mapped_column("assignees", Text, nullable=True)
     due_date: Mapped[str | None] = mapped_column(String(32))
     status: Mapped[ProblemStatus] = mapped_column(Enum(ProblemStatus), default=ProblemStatus.IN_PROGRESS)  # <-- статус
     note: Mapped[str | None] = mapped_column(Text)                            # <-- примечание (причина отклонения)
@@ -61,6 +62,29 @@ class Problem(Base):
     reports: Mapped[List["Report"]] = relationship(back_populates="problem")
 
     __table_args__ = (UniqueConstraint("list_id", "number", name="uix_problem_list_number"),)
+
+    # Удобное свойство: список ID
+    @property
+    def assignees(self) -> list[int]:
+        if not self.assignees_raw:
+            return []
+        ids: list[int] = []
+        for part in self.assignees_raw.split(","):
+            p = part.strip()
+            if not p:
+                continue
+            try:
+                ids.append(int(p))
+            except ValueError:
+                continue
+        return ids
+
+    @assignees.setter
+    def assignees(self, values: list[int] | None) -> None:
+        if not values:
+            self.assignees_raw = None
+        else:
+            self.assignees_raw = ",".join(str(v) for v in values)
 
 class ReportStatus(StrEnum):
     PENDING="pending"; ACCEPTED="accepted"; REJECTED="rejected"

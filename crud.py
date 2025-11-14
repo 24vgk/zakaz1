@@ -1,6 +1,6 @@
 
 from __future__ import annotations
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Dict, Any
 from sqlalchemy import select, func, case
 from sqlalchemy.ext.asyncio import AsyncSession
 from models import User, Role, Problem, Report, ReportStatus, ReportMedia, MediaType, ProblemList, ProblemStatus
@@ -49,59 +49,102 @@ async def list_problem_lists(session: AsyncSession, *, only_open: bool = False) 
         q = q.where(ProblemList.is_closed.is_(False))
     return (await session.execute(q)).scalars().all()
 
+
+def assignees_to_str(lst: list[int]) -> str:
+    return ",".join(str(x) for x in lst)
+
+def assignees_from_str(s: str | None) -> list[int]:
+    if not s:
+        return []
+    out = []
+    for part in s.split(","):
+        part = part.strip()
+        try:
+            out.append(int(part))
+        except:
+            pass
+    return out
+
 async def upsert_problems(
     session: AsyncSession,
     list_code: str,
-    list_code_file: str,
-    rows: list[dict],
+    rows: List[Dict[str, Any]],
+    list_title: str | None = None,
 ) -> ProblemList:
     """
-    Обновляет/создаёт список проблем и его проблемы по данным из файла.
+    Создаёт или обновляет список проблем с кодом `list_code`.
 
-    list_code — код списка (берём из имени файла)
-    rows      — список dict'ов:
-                {"number", "title", "assignee", "due_date"}
-    Возвращает ProblemList.
+    rows — это список dict от parse_problems_xlsx / parse_problems_csv:
+        {
+            "number": int,
+            "title": str,
+            "assignees": list[int],
+            "due_date": str | None,
+        }
+
+    Поведение:
+      - если ProblemList с таким code нет — создаём;
+      - для каждой строки обновляем/создаём Problem с этим list_id и number;
+      - статусы Problem НЕ трогаем (чтобы не сбрасывать принятые/отклонённые).
     """
-    # находим или создаём сам список
-    result = await session.execute(
+
+    # 1. Ищем (или создаём) ProblemList
+    res_pl = await session.execute(
         select(ProblemList).where(ProblemList.code == list_code)
     )
-    plist: ProblemList | None = result.scalar_one_or_none()
+    plist = res_pl.scalar_one_or_none()
 
     if plist is None:
-        plist = ProblemList(code=list_code, title=list_code_file)
-        session.add(plist)
-        await session.flush()  # чтобы получить id
-
-    for r in rows:
-        number = int(r["number"])
-        title = r.get("title") or ""
-        assignee = r.get("assignee")
-        due_date = r.get("due_date")
-
-        # ищем проблему внутри этого списка
-        result = await session.execute(
-            select(Problem).where(
-                Problem.list_id == plist.id,
-                Problem.number == number,
-            )
+        plist = ProblemList(
+            code=list_code,
+            title=list_title or list_code,
+            is_closed=False,
         )
-        prob: Problem | None = result.scalar_one_or_none()
+        session.add(plist)
+        # нужен flush, чтобы появился plist.id для ForeignKey
+        await session.flush()
+
+    # 2. Загружаем уже существующие проблемы этого списка
+    res_probs = await session.execute(
+        select(Problem).where(Problem.list_id == plist.id)
+    )
+    existing: dict[int, Problem] = {p.number: p for p in res_probs.scalars().all()}
+
+    # 3. Обрабатываем строки из файла
+    for r in rows:
+        try:
+            number = int(r["number"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        title = (r.get("title") or "").strip()
+        assignees: list[int] = r.get("assignees") or []
+        due_date = r.get("due_date")
+        if isinstance(due_date, str):
+            due_date = due_date.strip() or None
+
+        prob = existing.get(number)
 
         if prob is None:
+            # создаём новую задачу
             prob = Problem(
                 list_id=plist.id,
                 number=number,
                 status=ProblemStatus.IN_PROGRESS,
             )
             session.add(prob)
+            existing[number] = prob
 
-        prob.title = title
-        prob.assignee = assignee
+        # обновляем поля
+        if title:
+            prob.title = title
+        # тут предполагается, что в модели Problem есть
+        # property assignees/assignees_raw как мы делали ранее
+        prob.assignees = assignees
         prob.due_date = due_date
 
-    await session.commit()
+    # коммит снаружи или здесь — на твой вкус
+    # здесь можно не коммитить, если выше ты делаешь session.commit()
     return plist
 
 async def get_problem_by_list_and_number(session: AsyncSession, list_code: str, number: int) -> dict | None:
@@ -165,15 +208,20 @@ async def user_stats(session: AsyncSession, tg_id: int) -> dict:
     Статистика по ЗАДАЧАМ для исполнителя с данным Telegram ID.
     Считаем каждую проблему один раз по её текущему статусу.
     """
+
+    pattern = f"%,{tg_id},%"
+
     q = await session.execute(
         select(
             Problem.status,
             func.count(Problem.id)
-        )
-        .where(Problem.assignee == tg_id)
-        .group_by(Problem.status)
+        ).where(
+            Problem.assignees_raw.is_not(None),
+            ("," + Problem.assignees_raw + ",").like(pattern),
+        ).group_by(Problem.status)
     )
     rows = q.all()
+
     by_status: dict[ProblemStatus, int] = {status: cnt for status, cnt in rows}
 
     in_progress = by_status.get(ProblemStatus.IN_PROGRESS, 0)

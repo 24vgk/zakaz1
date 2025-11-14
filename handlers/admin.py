@@ -110,7 +110,7 @@ async def handle_table(msg: Message, state: FSMContext, event_from_user_role: st
 
         # обновляем/создаём список и его проблемы
         async with session_scope() as s:
-            plist = await upsert_problems(s, list_code, list_code_file, rows)
+            plist = await upsert_problems(s, list_code, rows)
 
         # создаём тему в группе для этого списка (если указана GROUP_CHAT_ID)
         if GROUP_CHAT_ID:
@@ -199,42 +199,51 @@ async def _send_list_stats(message, list_code: str):
         return
 
     # --- готовим данные для диаграммы ---
+    # --- готовим данные для диаграммы ---
     labels: list[str] = []
     sizes: list[int] = []
+    colors: list[str] = []  # <<< ДОБАВЛЕНО
 
     if in_work > 0:
         labels.append("В работе")
         sizes.append(in_work)
+        colors.append("#FFD700")  # 🟡 золотой
 
     if report_sent > 0:
         labels.append("Отправлен отчёт")
         sizes.append(report_sent)
+        colors.append("#1E90FF")  # 🔵 ярко-синий
 
     if accepted > 0:
         labels.append("Принято")
         sizes.append(accepted)
+        colors.append("#32CD32")  # 🟢 лаймовый зелёный
 
     if rejected > 0:
         labels.append("Отклонено")
         sizes.append(rejected)
+        colors.append("#FF4500")  # 🔴 оранжево-красный
 
-    # --- рисуем "объёмную" круговую диаграмму ---
+    # --- рисуем круговую диаграмму ---
     fig, ax = plt.subplots(figsize=(5, 5))
 
-    # лёгкий "explode", чтобы сектора чуть разошлись
     explode = [0.05] * len(sizes)
 
     wedges, texts, autotexts = ax.pie(
         sizes,
         labels=labels,
+        colors=colors,  # <<< ВАЖНО: цвета совпадают с caption
         autopct=lambda pct: f"{pct:.1f}%",
         explode=explode,
-        startangle=90,   # повернём для красоты
-        shadow=True,     # даёт псевдо-объём
+        startangle=90,
+        shadow=True,
     )
 
     for autot in autotexts:
         autot.set_size(9)
+
+    ax.set_title(f"Статистика по списку {list_code}")
+    ax.axis("equal")
 
     ax.set_title(f"Статистика по списку {list_code}")
     ax.axis("equal")  # круг, а не овал
@@ -315,7 +324,7 @@ async def cb_admin_stats(call: CallbackQuery, event_from_user_role: str | None =
 async def cb_admin_stats_list(call: CallbackQuery, event_from_user_role: str | None = None):
     if not await guard_admin(call, event_from_user_role):
         return
-    _, _, _, list_code = call.data.split(":", 3)
+    _, _, list_code = call.data.split(":", 3)
     await _send_list_stats(call.message, list_code)
     await call.answer()
 
@@ -500,7 +509,8 @@ async def cb_admin_users(call: CallbackQuery, event_from_user_role: str | None =
         users = res.scalars().all()
 
     if not users:
-        await call.message.edit_text(
+        # тут тоже безопаснее отвечать новым сообщением
+        await call.message.answer(
             "Пользователей в БД пока нет.",
             reply_markup=admin_main_menu(),
         )
@@ -514,14 +524,14 @@ async def cb_admin_users(call: CallbackQuery, event_from_user_role: str | None =
         name = " ".join(filter(None, [u.first_name, u.last_name])).strip()
         if not name:
             name = u.username or ""
-        return f"<code>{u.id}</code> - {name or u.username} - {u.role.value}"
+        return f"{u.id} - {name or 'без имени'} - {u.role.value}"
 
     lines: list[str] = []
 
     if admins:
         lines.append("<b>Администраторы:</b>")
         lines += [f"• {fmt_user(u)}" for u in admins]
-        lines.append("")  # пустая строка-разделитель
+        lines.append("")
 
     if regular:
         lines.append("<b>Пользователи:</b>")
@@ -529,9 +539,9 @@ async def cb_admin_users(call: CallbackQuery, event_from_user_role: str | None =
 
     text = "\n".join(lines)
 
-    # Кнопки для "копирования" — по клику алерт с ID
+    # Кнопки для "копирования" ID
     kb_rows = []
-    for u in users[:50]:  # на всякий случай ограничим до 50
+    for u in users[:50]:
         label_name = u.first_name or u.username or "user"
         kb_rows.append([
             InlineKeyboardButton(
@@ -539,10 +549,15 @@ async def cb_admin_users(call: CallbackQuery, event_from_user_role: str | None =
                 callback_data=f"admin:userid:{u.id}",
             )
         ])
-
     kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:back_main")])
-
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
-    await call.message.edit_text(text, reply_markup=kb)
+    # 🔧 главное изменение:
+    if call.message.text:
+        # если это обычное текстовое сообщение — редактируем
+        await call.message.edit_text(text, reply_markup=kb)
+    else:
+        # если это медиа / что-то без текста — шлём новое
+        await call.message.answer(text, reply_markup=kb)
+
     await call.answer()

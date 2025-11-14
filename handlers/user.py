@@ -10,7 +10,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 
-from sqlalchemy import select
+from sqlalchemy import select, func, literal
 
 from config import GROUP_CHAT_ID
 from keyboards.user_kb import main_menu
@@ -108,7 +108,7 @@ def problems_menu(list_code: str, problems: list[dict]) -> InlineKeyboardMarkup:
         rows.append([
             InlineKeyboardButton(
                 text=f"#{num} — {short}",
-                callback_data=f"user:prob:{list_code}:{num}",
+                callback_data=f"user:problem:{list_code}:{num}",
             )
         ])
     rows.append([
@@ -142,25 +142,35 @@ def problem_detail_menu(list_code: str, number: int) -> InlineKeyboardMarkup:
 
 async def _load_user_lists(user_tg_id: int) -> list[str]:
     """
-    Открытые списки, в которых у пользователя есть НЕпринятые задачи.
+    Открытые списки, в которых у пользователя есть задачи
+    в статусах: IN_PROGRESS / REPORT_SENT / REJECTED.
     """
     async with session_scope() as s:
-        rows = await s.execute(
+        # колонка из БД (NOT property!)
+        ass_col = Problem.assignees_raw    # mapped_column("assignees", Text, ...)
+
+        # делаем ',<строка>,', чтобы искать целый ID
+        # COALESCE нужен, если assignees_raw = NULL
+        full = literal(",") + func.coalesce(ass_col, "") + literal(",")
+        pattern = f"%,{user_tg_id},%"
+
+        stmt = (
             select(ProblemList.code)
             .join(Problem, Problem.list_id == ProblemList.id)
             .where(
                 ProblemList.is_closed.is_(False),
-                Problem.assignee == user_tg_id,
                 Problem.status.in_([
                     ProblemStatus.IN_PROGRESS,
                     ProblemStatus.REPORT_SENT,
                     ProblemStatus.REJECTED,
                 ]),
+                full.like(pattern),
             )
             .distinct()
             .order_by(ProblemList.code)
         )
-        return [r[0] for r in rows.all()]
+        rows = await s.execute(stmt)
+        return list(rows.scalars().all())
 
 
 async def _load_problems_for_user(list_code: str, user_tg_id: int) -> list[dict]:
@@ -177,7 +187,7 @@ async def _load_problems_for_user(list_code: str, user_tg_id: int) -> list[dict]
             .join(ProblemList)
             .where(
                 ProblemList.code == list_code,
-                Problem.assignee == user_tg_id,
+                Problem.assignees_raw == user_tg_id,
                 Problem.status.in_([
                     ProblemStatus.IN_PROGRESS,
                     ProblemStatus.REPORT_SENT,
@@ -194,63 +204,95 @@ async def _load_problems_for_user(list_code: str, user_tg_id: int) -> list[dict]
     return problems
 
 
-async def _show_problems_in_list(msg: Message, list_code: str, user_tg_id: int):
-    """Редактирует сообщение, показывая список проблем пользователя в выбранном списке."""
-    problems = await _load_problems_for_user(list_code, user_tg_id)
+async def _show_problems_in_list(msg: Message, list_code: str, user_tg_id: int) -> None:
+    async with session_scope() as s:
+        ass_col = Problem.assignees_raw
+        full = literal(",") + func.coalesce(ass_col, "") + literal(",")
+        pattern = f"%,{user_tg_id},%"
 
-    if not problems:
-        await msg.edit_text(
-            f"В списке <b>{list_code}</b> нет задач, назначенных на вас.",
-            reply_markup=lists_menu([list_code]),
+        rows = await s.execute(
+            select(Problem, ProblemList)
+            .join(ProblemList, Problem.list_id == ProblemList.id)
+            .where(
+                ProblemList.code == list_code,
+                ProblemList.is_closed.is_(False),
+                full.like(pattern),
+            )
+            .order_by(Problem.number)
         )
-        return
 
-    lines = [f"Список: <b>{list_code}</b>", "", "Ваши проблемы:"]
-    for p in problems:
-        status_label = STATUS_LABELS.get(p["status"], str(p["status"]))
-        lines.append(f"#{p['number']} — {p['title']} [{status_label}]")
+        pairs = rows.all()
 
-    await msg.edit_text(
-        "\n".join(lines),
-        reply_markup=problems_menu(list_code, problems),
-    )
+    if not pairs:
+        text = f"В списке <b>{list_code}</b> нет задач, назначенных на вас."
+        kb = None
+    else:
+        status_map = {
+            ProblemStatus.IN_PROGRESS: "🟡 В работе",
+            ProblemStatus.REPORT_SENT: "🔵 Отчёт отправлен",
+            ProblemStatus.ACCEPTED:    "✅ Принят",
+            ProblemStatus.REJECTED:    "❌ Отклонён",
+        }
+
+        lines: list[str] = [f"<b>Список: {list_code}</b>", ""]
+        problems_for_kb: list[dict] = []
+
+        for p, plist in pairs:
+            status_label = status_map.get(p.status, p.status.value)
+            line = f"№{p.number}: {p.title}\n    {status_label}"
+            if p.note:
+                line += f"\n    Примечание: {p.note}"
+            lines.append(line)
+            lines.append("")
+
+            problems_for_kb.append(
+                {
+                    "id": p.id,
+                    "number": p.number,
+                    "title": p.title,
+                    "status": p.status.value,
+                }
+            )
+
+        text = "\n".join(lines).rstrip()
+        kb = problems_menu(list_code, problems_for_kb)
+
+    try:
+        await msg.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest as e:
+        # если юзер повторно жмёт ту же кнопку — Telegram ругается,
+        # можно просто игнорировать или отправить новое сообщение.
+        if "message is not modified" in str(e):
+            return
+        raise
 
 
 async def _load_problem_detail(list_code: str, number: int) -> dict | None:
-    """
-    Подробности проблемы: id, title, status, due_date, note, assignee, is_closed.
-    """
     async with session_scope() as s:
-        rows = await s.execute(
-            select(
-                Problem.id,
-                Problem.title,
-                Problem.status,
-                Problem.due_date,
-                Problem.note,
-                Problem.assignee,
-                ProblemList.is_closed,
-            )
-            .join(ProblemList)
+        row = await s.execute(
+            select(Problem, ProblemList)
+            .join(ProblemList, Problem.list_id == ProblemList.id)
             .where(
                 ProblemList.code == list_code,
                 Problem.number == number,
             )
-            .limit(1)
         )
-        row = rows.first()
-    if not row:
+        res = row.first()
+
+    if not res:
         return None
 
-    pid, title, status, due, note, assignee, is_closed = row
+    problem, plist = res
+
     return {
-        "id": pid,
-        "title": title,
-        "status": status,
-        "due_date": due,
-        "note": note,
-        "assignee": assignee,
-        "is_closed": bool(is_closed),
+        "id": problem.id,
+        "number": problem.number,
+        "title": problem.title,
+        "assignees": problem.assignees,   # ← property -> list[int]
+        "due_date": problem.due_date,
+        "status": problem.status.value,
+        "note": problem.note,
+        "is_closed": plist.is_closed,
     }
 
 
@@ -351,57 +393,99 @@ async def cb_back_problems(call: CallbackQuery, event_from_user_role: str | None
 
 # ===== Карточка проблемы =====
 
-@user_router.callback_query(F.data.startswith("user:prob:"))
-async def cb_problem_detail(call: CallbackQuery, event_from_user_role: str | None = None):
+@user_router.callback_query(F.data.startswith("user:problem:"))
+async def cb_problem_detail(
+    call: CallbackQuery,
+    event_from_user_role: str | None = None,
+):
     if not await guard_user(call, event_from_user_role):
         return
 
-    _, _, list_code, num_s = call.data.split(":", 3)
-    number = int(num_s)
+    # callback_data: user:problem:<list_code>:<number>
+    try:
+        _, _, list_code, num_s = call.data.split(":", 3)
+        number = int(num_s)
+    except Exception:
+        await call.answer("Некорректные данные кнопки.", show_alert=True)
+        return
 
+    # грузим данные проблемы (важно, чтобы _load_problem_detail возвращал 'assignees')
     p = await _load_problem_detail(list_code, number)
     if not p:
         await call.message.edit_text("Эта проблема не найдена.")
         await call.answer()
         return
 
-    # только назначенный исполнитель видит карточку
-    if p["assignee"] is not None and p["assignee"] != call.from_user.id:
-        await call.message.edit_text("Эта проблема назначена на другого исполнителя.")
+    # список исполнителей (новый формат)
+    assignees: list[int] = p.get("assignees") or []
+
+    # на всякий случай — совместимость со старым форматом, если вдруг в словаре есть 'assignee'
+    if not assignees and "assignee" in p:
+        single = p.get("assignee")
+        if isinstance(single, int):
+            assignees = [single]
+        elif isinstance(single, (str, float)):
+            try:
+                assignees = [int(single)]
+            except (TypeError, ValueError):
+                assignees = []
+
+    # если указаны исполнители — текущий пользователь должен быть среди них
+    if assignees and call.from_user.id not in assignees:
+        await call.message.edit_text(
+            "⛔ Эта проблема назначена другим исполнителям.\n"
+            "Вы не можете просматривать её детали и отправлять по ней отчёты."
+        )
         await call.answer()
         return
 
-    status_label = STATUS_LABELS.get(p["status"], str(p["status"]))
-    title = p["title"] or "(без названия)"
-    due = p["due_date"] or ""
-    note = p["note"] or ""
+    # дальше — то, что у тебя уже было: формирование текста и кнопок
+    # Пример (адаптируй под свой реальный текст/клавиатуру):
 
-    lines = [
-        f"Список: <b>{list_code}</b>",
-        f"Проблема №{number}",
-        f"Название: {title}",
-        f"Статус: {status_label}",
+    status = p.get("status")
+    note = p.get("note") or ""
+    due_date = p.get("due_date") or "-"
+
+    # красивый статус
+    status_map = {
+        "in_progress": "🟡 В работе",
+        "report_sent": "🟠 Отчёт отправлен",
+        "accepted": "🟢 Отчёт принят",
+        "rejected": "🔴 Отчёт отклонён",
+    }
+    status_human = status_map.get(status, status or "-")
+
+    # текст карточки задачи
+    text_lines = [
+        f"<b>Список:</b> {list_code}",
+        f"<b>Проблема №{number}:</b> {p.get('title') or ''}",
+        f"<b>Статус:</b> {status_human}",
+        f"<b>Срок:</b> {due_date}",
     ]
-    if due:
-        lines.append(f"Срок: {due}")
     if note:
-        lines.append("")
-        lines.append(f"Примечание администратора:\n{note}")
+        text_lines.append(f"<b>Примечание:</b> {note}")
 
-    await call.message.edit_text(
-        "\n".join(lines),
-        reply_markup=problem_detail_menu(list_code, number),
-    )
+    text = "\n".join(text_lines)
+
+    # клавиатура: "Загрузить отчёт" + "Назад к списку"
+    kb = problem_detail_menu(list_code, number)
+
+    await call.message.edit_text(text, reply_markup=kb)
     await call.answer()
 
 
 # ===== Запуск загрузки отчёта из карточки проблемы =====
 
 @user_router.callback_query(F.data.startswith("user:upload_for:"))
-async def cb_upload_for_problem(call: CallbackQuery, state: FSMContext, event_from_user_role: str | None = None):
+async def cb_upload_for_problem(
+    call: CallbackQuery,
+    state: FSMContext,
+    event_from_user_role: str | None = None,
+):
     if not await guard_user(call, event_from_user_role):
         return
 
+    # callback_data: user:upload_for:<list_code>:<number>
     _, _, list_code, num_s = call.data.split(":", 3)
     number = int(num_s)
 
@@ -411,13 +495,19 @@ async def cb_upload_for_problem(call: CallbackQuery, state: FSMContext, event_fr
         await call.answer()
         return
 
-    if p["is_closed"]:
+    if p.get("is_closed"):
         await call.message.edit_text("⛔ Список закрыт. Отчёты по этой проблеме не принимаются.")
         await call.answer()
         return
 
-    if p["assignee"] is not None and p["assignee"] != call.from_user.id:
-        await call.message.edit_text("⛔ Отчёт по этой проблеме может отправить только назначенный исполнитель.")
+    # тут _load_problem_detail ДОЛЖЕН вернуть:
+    #   "assignees": list[int]
+    assignees: list[int] = p.get("assignees") or []
+
+    if assignees and call.from_user.id not in assignees:
+        await call.message.edit_text(
+            "⛔ Отчёт по этой проблеме могут отправлять только назначенные исполнители."
+        )
         await call.answer()
         return
 
@@ -432,6 +522,7 @@ async def cb_upload_for_problem(call: CallbackQuery, state: FSMContext, event_fr
         f"Вы выбрали проблему №{number} из списка <b>{list_code}</b>.\n\n{ASK_DATA}"
     )
     await call.answer()
+
 
 
 # ===== Приём любого контента как отчёта =====
@@ -478,7 +569,7 @@ async def receive_anything(msg: Message, state: FSMContext, event_from_user_role
             content = (caption or "").encode("utf-8")
 
         p1, p2, p3 = build_paths(problem_id, msg.from_user.id, report_id, filename)
-        save_bytes_to_all((p1, p2, p3), content)
+        save_bytes_to_all((p3,), content)
 
         async with session_scope() as s:
             await add_media(
@@ -486,7 +577,7 @@ async def receive_anything(msg: Message, state: FSMContext, event_from_user_role
                 report_id=report_id,
                 kind=kind,
                 file_id=file_id,
-                file_path=str(p1),
+                file_path=str(p3),
                 caption=caption if caption else None,
             )
 

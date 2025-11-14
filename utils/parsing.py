@@ -4,6 +4,7 @@ import io
 from io import StringIO, BytesIO
 from typing import Iterable, Iterator, Dict, Any
 import datetime as dt
+from datetime import datetime, date
 
 try:
     from openpyxl import load_workbook
@@ -66,72 +67,133 @@ def parse_problems_csv(data: bytes) -> Iterator[dict]:
         }
 
 
-def parse_problems_xlsx(data: bytes) -> Iterator[dict]:
+def _parse_assignees(value: Any) -> list[int]:
     """
-    Ожидаемый формат файла (твоя таблица):
-    id | title | assignee | due_date
+    Парсит колонку assignee, где может быть:
+      - один ID:   123456789
+      - несколько: 123456789, 777777777, 999999999
 
-    Где:
-      id        – номер проблемы (int, может быть 101, 102 и т.п.)
-      title     – текст описания
-      assignee  – Telegram ID исполнителя (int)
-      due_date  – дата (Excel-дата или текст YYYY-MM-DD)
-
-    Возвращает dict'ы:
-      {
-        "number": int,
-        "title": str,
-        "assignee": int | None,
-        "due_date": date | None,
-      }
+    Возвращает список int.
     """
-    buf = io.BytesIO(data)
-    wb = load_workbook(buf, data_only=True)
+    if value is None:
+        return []
+    s = str(value).strip()
+    if not s:
+        return []
+
+    ids: list[int] = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.append(int(part))
+        except ValueError:
+            # если мусор — просто пропускаем этот кусок
+            continue
+    return ids
+
+
+def _normalize_due_date(value: Any) -> str | None:
+    """
+    Приводим дату к строке 'YYYY-MM-DD' или None, если даты нет/некорректна.
+    """
+    if value is None:
+        return None
+
+    # Excel-дата как datetime / date
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+
+    s = str(value).strip()
+    if not s:
+        return None
+
+    # Пробуем несколько форматов, если не вышло — возвращаем как есть
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
+        try:
+            d = datetime.strptime(s, fmt).date()
+            return d.isoformat()
+        except ValueError:
+            continue
+
+    # Если формат нестандартный, но тебе ок — можно вернуть как есть
+    return s
+
+
+def parse_problems_xlsx(data: bytes) -> Iterator[Dict[str, object]]:
+    """
+    Парсер XLSX-файла со списком проблем.
+
+    Ожидаемые колонки в первой строке (регистр не важен):
+
+        number     / id      / №   — номер задачи в списке (обязателен)
+        title                 — текст/описание задачи
+        assignee              — Telegram ID исполнителя/исполнителей (через запятую)
+        due_date              — срок исполнения (желательно в формате YYYY-MM-DD)
+
+    На выходе даёт dict:
+        {
+            "number": int,
+            "title": str,
+            "assignees": list[int],
+            "due_date": str | None,
+        }
+    """
+    wb = load_workbook(BytesIO(data), data_only=True)
     ws = wb.active
 
-    # читаем шапку
-    header = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
+    # --- читаем заголовок ---
+    header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+    headers: dict[str, int] = {}
 
-    def col_idx(name: str) -> int:
+    for idx, col_name in enumerate(header_row):
+        if col_name is None:
+            continue
+        name = str(col_name).strip().lower()
+        headers[name] = idx
+
+    def get_col(row_values: tuple, *names: str) -> Any:
+        """
+        Берём значение по одному из возможных имён колонки.
+        Например: get_col(row, "number", "id", "№")
+        """
+        for n in names:
+            idx = headers.get(n)
+            if idx is not None and idx < len(row_values):
+                return row_values[idx]
+        return None
+
+    # --- пробегаем по строкам, начиная со 2-й ---
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if row is None:
+            continue
+
+        raw_number = get_col(row, "number", "id", "№")
+        if raw_number is None:
+            # строка без номера нам не интересна
+            continue
+
         try:
-            return header.index(name)
+            number = int(str(raw_number).strip())
         except ValueError:
-            raise ValueError(f"В XLSX не найдена колонка '{name}'")
-
-    idx_id = col_idx("id")
-    idx_title = col_idx("title")
-    idx_assignee = col_idx("assignee")
-    idx_due = col_idx("due_date")
-
-    for row in ws.iter_rows(min_row=2):
-        id_cell = row[idx_id].value
-        title_cell = row[idx_title].value
-        assignee_cell = row[idx_assignee].value
-        due_cell = row[idx_due].value
-
-        if id_cell is None and title_cell is None:
+            # некорректный номер — пропускаем
             continue
 
-        try:
-            number = int(id_cell)
-        except (TypeError, ValueError):
-            # пропускаем строки без корректного id
-            continue
+        title_val = get_col(row, "title")
+        title = (str(title_val).strip() if title_val is not None else "") or f"Задача #{number}"
 
-        title = str(title_cell).strip() if title_cell is not None else ""
+        assignee_val = get_col(row, "assignee")
+        assignees = _parse_assignees(assignee_val)
 
-        assignee = None
-        if assignee_cell is not None and str(assignee_cell).strip():
-            try:
-                assignee = int(str(assignee_cell).strip())
-            except ValueError:
-                assignee = None
-
-        due_date = _to_date(due_cell)
+        due_val = get_col(row, "due_date", "due", "deadline")
+        due_date = _normalize_due_date(due_val)
 
         yield {
             "number": number,
             "title": title,
-            "assignee": assignee,
-            "due_date": due_date,
+            "assignees": assignees,  # список int
+            "due_date": due_date,    # строка 'YYYY-MM-DD' или None
         }
