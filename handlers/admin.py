@@ -12,7 +12,7 @@ from config import GROUP_CHAT_ID
 from db import session_scope
 from crud import upsert_problems, set_report_status, problems_stats, set_admin, set_problem_status, \
     close_list_if_completed
-from models import ReportStatus, Report, ProblemStatus, Problem, ProblemList
+from models import ReportStatus, Report, ProblemStatus, Problem, ProblemList, Role, User
 from utils.parsing import parse_problems_csv, parse_problems_xlsx
 
 from keyboards.admin_main_kb import admin_main_menu
@@ -488,3 +488,61 @@ async def admin_reject_reason(msg: Message, state: FSMContext, event_from_user_r
     )
 
     await state.clear()
+
+
+@admin_router.callback_query(F.data == "admin:users")
+async def cb_admin_users(call: CallbackQuery, event_from_user_role: str | None = None):
+    if not await guard_admin(call, event_from_user_role):
+        return
+
+    async with session_scope() as s:
+        res = await s.execute(select(User).order_by(User.role, User.id))
+        users = res.scalars().all()
+
+    if not users:
+        await call.message.edit_text(
+            "Пользователей в БД пока нет.",
+            reply_markup=admin_main_menu(),
+        )
+        await call.answer()
+        return
+
+    admins = [u for u in users if u.role == Role.ADMIN]
+    regular = [u for u in users if u.role == Role.USER]
+
+    def fmt_user(u: User) -> str:
+        name = " ".join(filter(None, [u.first_name, u.last_name])).strip()
+        if not name:
+            name = u.username or ""
+        return f"<code>{u.id}</code> - {name or u.username} - {u.role.value}"
+
+    lines: list[str] = []
+
+    if admins:
+        lines.append("<b>Администраторы:</b>")
+        lines += [f"• {fmt_user(u)}" for u in admins]
+        lines.append("")  # пустая строка-разделитель
+
+    if regular:
+        lines.append("<b>Пользователи:</b>")
+        lines += [f"• {fmt_user(u)}" for u in regular]
+
+    text = "\n".join(lines)
+
+    # Кнопки для "копирования" — по клику алерт с ID
+    kb_rows = []
+    for u in users[:50]:  # на всякий случай ограничим до 50
+        label_name = u.first_name or u.username or "user"
+        kb_rows.append([
+            InlineKeyboardButton(
+                text=f"{label_name} ({u.id})",
+                callback_data=f"admin:userid:{u.id}",
+            )
+        ])
+
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:back_main")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
