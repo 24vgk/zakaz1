@@ -204,7 +204,16 @@ async def _load_problems_for_user(list_code: str, user_tg_id: int) -> list[dict]
     return problems
 
 
-async def _show_problems_in_list(msg: Message, list_code: str, user_tg_id: int) -> None:
+async def _show_problems_in_list(
+    msg: Message,
+    list_code: str,
+    user_tg_id: int,
+    page: int = 0,
+) -> None:
+    """
+    Показывает задачи пользователя в списке с пагинацией.
+    page – номер страницы (0-based).
+    """
     async with session_scope() as s:
         ass_col = Problem.assignees_raw
         full = literal(",") + func.coalesce(ass_col, "") + literal(",")
@@ -225,43 +234,108 @@ async def _show_problems_in_list(msg: Message, list_code: str, user_tg_id: int) 
 
     if not pairs:
         text = f"В списке <b>{list_code}</b> нет задач, назначенных на вас."
-        kb = None
-    else:
-        status_map = {
-            ProblemStatus.IN_PROGRESS: "🟡 В работе",
-            ProblemStatus.REPORT_SENT: "🔵 Отчёт отправлен",
-            ProblemStatus.ACCEPTED:    "✅ Принят",
-            ProblemStatus.REJECTED:    "❌ Отклонён",
-        }
+        try:
+            await msg.edit_text(text)
+        except TelegramBadRequest as e:
+            if "message is not modified" not in str(e):
+                raise
+        return
 
-        lines: list[str] = [f"<b>Список: {list_code}</b>", ""]
-        problems_for_kb: list[dict] = []
+    # ---- ПАГИНАЦИЯ ----
+    page_size = 10
+    total = len(pairs)
+    max_page = (total - 1) // page_size  # минимум 0
 
-        for p, plist in pairs:
-            status_label = status_map.get(p.status, p.status.value)
-            line = f"№{p.number}: {p.title}\n    {status_label}"
-            if p.note:
-                line += f"\n    Примечание: {p.note}"
-            lines.append(line)
-            lines.append("")
+    if page < 0:
+        page = 0
+    if page > max_page:
+        page = max_page
 
-            problems_for_kb.append(
-                {
-                    "id": p.id,
-                    "number": p.number,
-                    "title": p.title,
-                    "status": p.status.value,
-                }
+    start = page * page_size
+    end = min(start + page_size, total)
+    current_pairs = pairs[start:end]
+
+    status_map = {
+        ProblemStatus.IN_PROGRESS: "🟡 В работе",
+        ProblemStatus.REPORT_SENT: "🔵 Отчёт отправлен",
+        ProblemStatus.ACCEPTED:    "✅ Принят",
+        ProblemStatus.REJECTED:    "❌ Отклонён",
+    }
+
+    lines: list[str] = [f"<b>Список: {list_code}</b>", ""]
+    problems_for_kb: list[dict] = []
+
+    for p, plist in current_pairs:
+        status_label = status_map.get(p.status, p.status.value)
+        line = f"№{p.number}: {p.title}\n    {status_label}"
+        if p.note:
+            line += f"\n    Примечание: {p.note}"
+        lines.append(line)
+        lines.append("")
+
+        problems_for_kb.append(
+            {
+                "id": p.id,
+                "number": p.number,
+                "title": p.title,
+                "status": p.status.value,
+            }
+        )
+
+    lines.append(
+        f"Показаны задачи {start + 1}–{end} из {total} (стр. {page + 1}/{max_page + 1})."
+    )
+    text = "\n".join(lines).rstrip()
+    if len(text) > 4000:
+        text = text[:4000] + "\n\n(текст обрезан)"
+
+    # ---- КЛАВИАТУРА С КНОПКАМИ ЗАДАЧ И ПАГИНАЦИЕЙ ----
+    kb_rows: list[list[InlineKeyboardButton]] = []
+
+    # Кнопки задач (только текущая страница)
+    for p in problems_for_kb:
+        num = p["number"]
+        title = p["title"] or ""
+        short = title if len(title) <= 40 else title[:37] + "..."
+        kb_rows.append([
+            InlineKeyboardButton(
+                text=f"#{num} — {short}",
+                callback_data=f"user:problem:{list_code}:{num}",
             )
+        ])
 
-        text = "\n".join(lines).rstrip()
-        kb = problems_menu(list_code, problems_for_kb)
+    # Навигация страницами
+    nav_row: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="◀️ Назад",
+                callback_data=f"user:plist_page:{list_code}:{page - 1}",
+            )
+        )
+    if page < max_page:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="Вперёд ▶️",
+                callback_data=f"user:plist_page:{list_code}:{page + 1}",
+            )
+        )
+    if nav_row:
+        kb_rows.append(nav_row)
+
+    # Назад к спискам
+    kb_rows.append([
+        InlineKeyboardButton(
+            text="⬅️ Назад к спискам",
+            callback_data="user:back_lists",
+        )
+    ])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
     try:
         await msg.edit_text(text, reply_markup=kb)
     except TelegramBadRequest as e:
-        # если юзер повторно жмёт ту же кнопку — Telegram ругается,
-        # можно просто игнорировать или отправить новое сообщение.
         if "message is not modified" in str(e):
             return
         raise
@@ -688,3 +762,23 @@ async def cb_stats(call: CallbackQuery, event_from_user_role: str | None = None)
             raise
 
     await call.answer("Обновлено ✅", show_alert=False)
+
+# ===== Пагинация =====
+@user_router.callback_query(F.data.startswith("user:plist_page:"))
+async def cb_view_list_page(call: CallbackQuery, event_from_user_role: str | None = None):
+    """
+    Листание страниц задач в одном списке.
+    callback_data: user:plist_page:<list_code>:<page>
+    """
+    if not await guard_user(call, event_from_user_role):
+        return
+
+    try:
+        _, _, list_code, page_s = call.data.split(":", 3)
+        page = int(page_s)
+    except Exception:
+        await call.answer("Некорректная страница.", show_alert=True)
+        return
+
+    await _show_problems_in_list(call.message, list_code, call.from_user.id, page=page)
+    await call.answer()

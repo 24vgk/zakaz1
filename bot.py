@@ -7,6 +7,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from config import BOT_TOKEN
 from db import init_db
 from handlers import user_router, admin_router, common_router
+from logging_config import setup_logging
 from middlewares.role_mw import RoleMiddleware
 from reminders import send_due_reminders
 import logging
@@ -16,7 +17,10 @@ def ensure_token():
     if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN is not set. Put it to .env")
 
 async def main():
-    ensure_token(); await init_db()
+    setup_logging()
+
+    ensure_token()
+    await init_db()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
@@ -25,8 +29,8 @@ async def main():
     scheduler.add_job(
         send_due_reminders,
         trigger="cron",
-        hour=18,
-        minute=51,
+        hour=22,
+        minute=30,
         args=[bot],
     )
 
