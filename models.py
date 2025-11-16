@@ -115,3 +115,61 @@ class ReportMedia(Base):
     file_path: Mapped[Optional[str]]=mapped_column(Text)
     caption: Mapped[Optional[str]]=mapped_column(Text)
     report: Mapped["Report"]=relationship(back_populates="media")
+
+
+class Staff(Base):
+    """
+    Справочник сотрудников из zakaz.xlsx
+
+    assignee  — Telegram ID исполнителя (для связки с задачами)
+    post      — должность
+    fio       — ФИО
+    """
+    __tablename__ = "staff"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    # Telegram ID, как в колонке assignee — делаем уникальным и индексируем
+    assignee: Mapped[int] = mapped_column(
+        BigInteger,
+        unique=True,
+        index=True,
+        nullable=False,
+    )
+
+    # должность (post)
+    post: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # ФИО (fio)
+    fio: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
+class ActEntry(Base):
+    """
+    Факт формирования акта по задаче для конкретного исполнителя.
+
+    problem_id + assignee — уникальная пара, чтобы второй раз
+    по этой же задаче и этому же исполнителю акт не формировался.
+    """
+    __tablename__ = "acts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    problem_id: Mapped[int] = mapped_column(
+        ForeignKey("problems.id"),
+        index=True,
+        nullable=False,
+    )
+    assignee: Mapped[int] = mapped_column(
+        BigInteger,
+        index=True,
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("problem_id", "assignee", name="uix_act_problem_assignee"),
+    )

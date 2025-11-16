@@ -1,23 +1,31 @@
 import io
+import os
+from collections import defaultdict
+from docxtpl import DocxTemplate
+from datetime import date
 from pathlib import Path
 from aiogram import Router, F
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import Message, CallbackQuery, BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import Message, CallbackQuery, BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup, \
+    FSInputFile
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import BaseFilter
-from sqlalchemy import select, func
-
+from sqlalchemy import select, func, or_
+from docx import Document
 from config import GROUP_CHAT_ID
 from db import session_scope
 from crud import upsert_problems, set_report_status, problems_stats, set_admin, set_problem_status, \
-    close_list_if_completed
-from models import ReportStatus, Report, ProblemStatus, Problem, ProblemList, Role, User
+    close_list_if_completed, upsert_staff
+from models import ReportStatus, Report, ProblemStatus, Problem, ProblemList, Role, User, Staff, ActEntry
 from utils.parsing import parse_problems_csv, parse_problems_xlsx
 
 from keyboards.admin_main_kb import admin_main_menu
 from keyboards.admin_manage_kb import admins_menu, cancel_kb
 import matplotlib
+
+from utils.staff_import import parse_staff_xlsx
+
 matplotlib.use("Agg")  # без GUI
 import matplotlib.pyplot as plt
 
@@ -26,8 +34,6 @@ class AdminOnly(BaseFilter):
         return data.get("event_from_user_role") == "admin"
 
 admin_router = Router(name="admin")
-# admin_router.callback_query.filter(AdminOnly())
-# admin_router.message.filter(AdminOnly())
 
 
 async def guard_admin(call_or_msg, event_from_user_role: str | None) -> bool:
@@ -43,10 +49,12 @@ async def guard_admin(call_or_msg, event_from_user_role: str | None) -> bool:
 
 class AdminStates(StatesGroup):
     waiting_list_code = State()
+    waiting_list_title = State()  # <<< НОВОЕ
     waiting_csv = State()
     waiting_reject_reason = State()
     waiting_add_admin_id = State()
     waiting_del_admin_id = State()
+    waiting_staff_file = State()
 
 # ===== Главная админ-панель =====
 @admin_router.callback_query(F.data == "admin:back_main")
@@ -55,15 +63,343 @@ async def cb_back_main(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("👋 Привет, администратор! Выберите действие:", reply_markup=admin_main_menu())
     await call.answer()
 
+
+# ===== Создание тестового акта =====
+def _docx_replace_all(doc: Document, mapping: dict[str, str]) -> None:
+    """Грубая замена {{placeholders}} по всему документу."""
+    def _replace_in_run(run, mapping):
+        text = run.text
+        changed = False
+        for k, v in mapping.items():
+            placeholder = f"{{{{{k}}}}}"   # {{title}}
+            if placeholder in text:
+                text = text.replace(placeholder, v)
+                changed = True
+        if changed:
+            run.text = text
+
+    # параграфы
+    for p in doc.paragraphs:
+        for r in p.runs:
+            _replace_in_run(r, mapping)
+
+    # таблицы
+    for tbl in doc.tables:
+        for row in tbl.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    for r in p.runs:
+                        _replace_in_run(r, mapping)
+
+
+@admin_router.callback_query(F.data == "admin:akt")
+async def cb_admin_create_akt_by_staff(
+    call: CallbackQuery,
+    event_from_user_role: str | None = None,
+):
+    """
+    Формирует акты по сотрудникам из таблицы Staff.
+
+    Для каждого staff.assignee:
+      - ищем проблемы со статусом ACCEPTED
+      - у которых assignees_raw начинается с этого ID (0-й индекс)
+      - и по которым ЕЩЁ НЕТ записи в Acts (ActEntry)
+      - подгружаем ProblemList (code, title)
+      - собираем один акт на сотрудника с его задачами
+      - после генерации записываем ActEntry, чтобы второй раз не брать.
+    """
+    if not await guard_admin(call, event_from_user_role):
+        return
+
+    await call.answer("Генерирую акты по исполнителям...", show_alert=False)
+
+    # папка для временных файлов
+    os.makedirs("temp", exist_ok=True)
+    doc_path = "shablon/akt.docx"
+
+    total_acts = 0
+
+    async with session_scope() as s:
+        # 1) Берём всех сотрудников
+        staff_rows = (
+            await s.execute(select(Staff).order_by(Staff.fio))
+        ).scalars().all()
+
+        for staff in staff_rows:
+            tg_id = staff.assignee
+
+            # --- подзапрос: есть ли уже акт по этой задаче и этому исполнителю
+            act_exists = (
+                select(ActEntry.id)
+                .where(
+                    ActEntry.problem_id == Problem.id,
+                    ActEntry.assignee == tg_id,
+                )
+                .exists()
+            )
+
+            # 2) Ищем задачи, где этот tg_id стоит ПЕРВЫМ в assignees_raw
+            #    и статус == ACCEPTED
+            #    и для них ещё нет записи в Acts
+            stmt = (
+                select(Problem, ProblemList)
+                .join(ProblemList, Problem.list_id == ProblemList.id)
+                .where(
+                    Problem.status == ProblemStatus.ACCEPTED,
+                    Problem.assignees_raw.isnot(None),
+                    or_(
+                        Problem.assignees_raw == str(tg_id),
+                        Problem.assignees_raw.like(f"{tg_id},%"),
+                    ),
+                    ~act_exists,  # <<< акт ещё не формировался
+                )
+                .order_by(ProblemList.code, Problem.number)
+            )
+            rows = (await s.execute(stmt)).all()
+
+            if not rows:
+                continue  # у этого сотрудника нет новых принятых задач – пропускаем
+
+            # 3) Собираем текст для {{data}}
+            lines: list[str] = []
+            for prob, plist in rows:
+                lines.append(
+                    f"№{prob.number}"
+                )
+            data_text = ", ".join(lines)
+
+            # 4) Берём данные ProblemList (из первого списка в выборке)
+            first_plist: ProblemList = rows[0][1]
+            list_title = first_plist.title or first_plist.code
+            list_code = first_plist.code
+
+            # 4) Готовим контекст для шаблона
+            context = {
+                "title": list_title,       # подгони под свой шаблон
+                "data": data_text,
+                "post": staff.post,
+                "fio": staff.fio,
+            }
+
+            # 5) Рендерим docx по шаблону
+            try:
+                doc = DocxTemplate(doc_path)
+            except Exception as e:
+                await call.message.answer(
+                    f"❌ Не удалось открыть шаблон акта: {e}",
+                    reply_markup=admin_main_menu(),
+                )
+                return
+
+            doc.render(context)
+
+            # имя файла: akt_<fio_or_id>.docx
+            safe_fio = (staff.fio or str(tg_id)).replace(" ", "_")
+            filename = f"akt_{list_code}_{safe_fio}.docx"
+            out_path = os.path.join("temp", filename)
+
+            doc.save(out_path)
+            total_acts += 1
+
+            # 6) Запоминаем, что по этим задачам и этому исполнителю акт уже сформирован
+            for prob, _plist in rows:
+                s.add(
+                    ActEntry(
+                        problem_id=prob.id,
+                        assignee=tg_id,
+                    )
+                )
+
+            # можно коммитить пачками, но одного в конце контекста обычно достаточно.
+            # я добавлю явный коммит после цикла по staff.
+            await call.message.answer_document(
+                document=FSInputFile(out_path),
+                caption=f"Акт для {staff.fio or tg_id}",
+            )
+            await call.message.answer_document(
+                document=FSInputFile(out_path),
+                caption=f"Акт для {staff.fio or tg_id}",
+            )
+
+        # фиксируем все ActEntry
+        await s.commit()
+
+    # 7) Итоговое сообщение
+    if total_acts == 0:
+        await call.message.answer(
+            "Не найдено новых задач в статусе <b>Принято</b> для формирования актов.",
+            reply_markup=admin_main_menu(),
+        )
+    else:
+        await call.message.answer(
+            f"Готово! Сформировано актов: <b>{total_acts}</b>.",
+            reply_markup=admin_main_menu(),
+        )
+
+# @admin_router.callback_query(F.data == "admin:akt")
+# async def cb_admin_create_akt(call: CallbackQuery):
+#     await call.answer("Генерирую акты...", show_alert=False)
+#
+#     # Создаём папку для актов, если её нет
+#     os.makedirs("temp", exist_ok=True)
+#
+#     doc_path = "shablon/akt.docx"
+#     generated_files = []
+#
+#     async with session_scope() as s:
+#         # Получаем все списки
+#         result = await s.execute(select(ProblemList))
+#         lists = result.scalars().all()
+#
+#         for plist in lists:
+#             # Берём все решённые проблемы
+#             res = await s.execute(
+#                 select(Problem)
+#                 .where(
+#                     Problem.list_id == plist.id,
+#                     Problem.status == ProblemStatus.ACCEPTED
+#                 )
+#             )
+#             problems = res.scalars().all()
+#
+#             if not problems:
+#                 continue
+#
+#             # Группируем по ответственным
+#             grouped: dict[int, list[Problem]] = {}
+#
+#             for prob in problems:
+#                 for tg_id in prob.assignees:
+#                     grouped.setdefault(tg_id, []).append(prob)
+#
+#             for tg_id, probs in grouped.items():
+#                 # Берём сотрудника
+#                 st = await s.execute(
+#                     select(Staff).where(Staff.assignee == tg_id)
+#                 )
+#                 staff = st.scalar_one_or_none()
+#
+#                 if not staff:
+#                     continue
+#
+#                 # Формируем список задач
+#                 data_text = ", ".join(f"№{prob.number}" for prob in probs)
+#
+#                 context = {
+#                     "title": plist.title,
+#                     "data": data_text,
+#                     "post": staff.post,
+#                     "fio": staff.fio,
+#                 }
+#
+#                 doc = DocxTemplate(doc_path)
+#                 doc.render(context)
+#
+#                 safe_code = plist.code.replace(" ", "_")
+#                 out_name = f"akt_{safe_code}_{tg_id}.docx"
+#                 out_path = os.path.join("temp", out_name)
+#
+#                 doc.save(out_path)
+#                 generated_files.append(out_path)
+#
+#     # Отправляем акты
+#     for path in generated_files:
+#         await call.message.answer_document(FSInputFile(path))
+#
+#     if not generated_files:
+#         await call.message.answer("Нет списков с решёнными задачами — акты не созданы.")
+#     else:
+#         await call.message.answer(f"Готово! Создано актов: {len(generated_files)}")
+
+# ===== Загрузка работников =====
+
+
+@admin_router.callback_query(F.data == "admin:upload_staff")
+async def cb_admin_upload_staff(
+    call: CallbackQuery,
+    state: FSMContext,
+    event_from_user_role: str | None = None,
+):
+    if not await guard_admin(call, event_from_user_role):
+        return
+
+    await state.set_state(AdminStates.waiting_staff_file)
+    await call.message.edit_text(
+        "Пришлите Excel-файл (.xlsx) со списком сотрудников.\n\n"
+        "Ожидаемые колонки:\n"
+        "• assignee — Telegram ID\n"
+        "• post — должность\n"
+        "• fio — ФИО",
+        reply_markup=admin_main_menu(),
+    )
+    await call.answer()
+
+
+@admin_router.message(AdminStates.waiting_staff_file)
+async def msg_admin_staff_file(
+    msg: Message,
+    state: FSMContext,
+    event_from_user_role: str | None = None,
+):
+    # защита по роли
+    if not await guard_admin(msg, event_from_user_role):
+        await state.clear()
+        return
+
+    # проверяем, что это документ
+    if not msg.document:
+        await msg.answer("Пожалуйста, пришлите файл в формате .xlsx как документ.")
+        return
+
+    filename = msg.document.file_name or ""
+    if not filename.lower().endswith(".xlsx"):
+        await msg.answer("Нужен файл в формате .xlsx.")
+        return
+
+    try:
+        file = await msg.bot.get_file(msg.document.file_id)
+        raw = await msg.bot.download_file(file.file_path)
+        data = raw.read()
+    except Exception as e:
+        await msg.answer(f"❌ Не удалось скачать файл.\nОшибка: {e}")
+        await state.clear()
+        return
+
+    # парсим
+    try:
+        rows = parse_staff_xlsx(data)
+        if not rows:
+            await msg.answer("Файл прочитан, но не найдено ни одной корректной строки.")
+            await state.clear()
+            return
+    except Exception as e:
+        await msg.answer(f"❌ Не удалось прочитать файл.\nОшибка: {e}")
+        await state.clear()
+        return
+
+    # пишем в БД
+    try:
+        async with session_scope() as s:
+            count = await upsert_staff(s, rows)
+    except Exception as e:
+        await msg.answer(f"❌ Не удалось обновить данные сотрудников.\nОшибка: {e}")
+        await state.clear()
+        return
+
+    await msg.answer(
+        f"✅ Данные сотрудников обновлены.\nОбработано записей: {count}.",
+        reply_markup=admin_main_menu(),
+    )
+    await state.clear()
+
 # ===== Загрузка проблем (кнопка) =====
 
 
 @admin_router.callback_query(F.data == "admin:upload_problems")
 async def cb_admin_upload(call: CallbackQuery, state: FSMContext, event_from_user_role: str | None = None):
-    # guard_admin(...) — если используешь
     await state.set_state(AdminStates.waiting_list_code)
     await call.message.edit_text(
-        "Введите код списка проблем (например: <code>upravdom-jan25</code>):",
+        "Введите название списка проблем:",
         reply_markup=cancel_kb()
     )
     await call.answer()
@@ -72,12 +408,30 @@ async def cb_admin_upload(call: CallbackQuery, state: FSMContext, event_from_use
 async def receive_list_code(msg: Message, state: FSMContext, event_from_user_role: str | None = None):
     code = (msg.text or "").strip()
     if not code:
-        await msg.answer("Код списка не должен быть пустым.", reply_markup=cancel_kb())
+        await msg.answer("Название списка не должено быть пустым.", reply_markup=cancel_kb())
         return
+
     await state.update_data(list_code=code)
+
+    # ТЕПЕРЬ спрашиваем название списка
+    await state.set_state(AdminStates.waiting_list_title)
+    await msg.answer(
+        f"✔ Наименование: <b>{code}</b>\n\nВведите номер Акта в формате '№10 от 20.10.2025':",
+        reply_markup=cancel_kb()
+    )
+
+@admin_router.message(AdminStates.waiting_list_title)
+async def receive_list_title(msg: Message, state: FSMContext, event_from_user_role: str | None = None):
+    title = (msg.text or "").strip()
+    if not title:
+        await msg.answer("Номер Акта не должен быть пустым.", reply_markup=cancel_kb())
+        return
+
+    await state.update_data(list_title=title)
+
     await state.set_state(AdminStates.waiting_csv)
     await msg.answer(
-        f"Ок. Код списка: <b>{code}</b>.\nТеперь отправьте XLSX с колонками: id, title, assignee, due_date.",
+        f"Номер Акта: <b>{title}</b>\nТеперь отправьте XLSX файл с задачами:",
         reply_markup=cancel_kb()
     )
 
@@ -95,6 +449,7 @@ async def handle_table(msg: Message, state: FSMContext, event_from_user_role: st
         # код списка = имя файла без расширения
         data_state = await state.get_data()
         list_code = data_state.get("list_code")  # <- берём введённое админом имя
+        list_title = data_state.get("list_title")
         list_code_file = Path(msg.document.file_name or "problems").stem
 
         # разбираем файл по твоему шаблону
@@ -110,7 +465,7 @@ async def handle_table(msg: Message, state: FSMContext, event_from_user_role: st
 
         # обновляем/создаём список и его проблемы
         async with session_scope() as s:
-            plist = await upsert_problems(s, list_code, rows)
+            plist = await upsert_problems(s, list_code, rows, list_title=list_title)
 
         # создаём тему в группе для этого списка (если указана GROUP_CHAT_ID)
         if GROUP_CHAT_ID:
@@ -154,15 +509,17 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("Действие отменено.", reply_markup=admin_main_menu())
     await call.answer()
 
-# ===== Статистика проблем (кнопка) =====
 async def _send_list_stats(message, list_code: str):
     """
     Рисует круговую диаграмму по ВСЕМ проблемам списка list_code
     и отправляет её как фото.
     Показывает 4 статуса: В работе, Отправлен отчёт, Принято, Отклонено.
+    Отдельно показывает количество просроченных (непринятых) задач.
     """
-    # --- тянем агрегацию по статусам для этого списка ---
+    today_str = date.today().strftime("%Y-%m-%d")
+
     async with session_scope() as s:
+        # --- агрегация по статусам ---
         rows = await s.execute(
             select(
                 Problem.status,
@@ -173,6 +530,19 @@ async def _send_list_stats(message, list_code: str):
             .group_by(Problem.status)
         )
         rows = rows.all()
+
+        # --- количество просроченных задач ---
+        overdue_q = await s.execute(
+            select(func.count(Problem.id))
+            .join(ProblemList)
+            .where(
+                ProblemList.code == list_code,
+                Problem.status != ProblemStatus.ACCEPTED,
+                Problem.due_date.isnot(None),
+                Problem.due_date < today_str,   # 'YYYY-MM-DD' – строковое сравнение корректно
+            )
+        )
+        overdue_total = overdue_q.scalar_one() or 0
 
     if not rows:
         await message.answer(
@@ -199,30 +569,29 @@ async def _send_list_stats(message, list_code: str):
         return
 
     # --- готовим данные для диаграммы ---
-    # --- готовим данные для диаграммы ---
     labels: list[str] = []
     sizes: list[int] = []
-    colors: list[str] = []  # <<< ДОБАВЛЕНО
+    colors: list[str] = []
 
     if in_work > 0:
         labels.append("В работе")
         sizes.append(in_work)
-        colors.append("#FFD700")  # 🟡 золотой
+        colors.append("#FFD700")  # 🟡
 
     if report_sent > 0:
         labels.append("Отправлен отчёт")
         sizes.append(report_sent)
-        colors.append("#1E90FF")  # 🔵 ярко-синий
+        colors.append("#1E90FF")  # 🔵
 
     if accepted > 0:
         labels.append("Принято")
         sizes.append(accepted)
-        colors.append("#32CD32")  # 🟢 лаймовый зелёный
+        colors.append("#32CD32")  # 🟢
 
     if rejected > 0:
         labels.append("Отклонено")
         sizes.append(rejected)
-        colors.append("#FF4500")  # 🔴 оранжево-красный
+        colors.append("#FF4500")  # 🔴
 
     # --- рисуем круговую диаграмму ---
     fig, ax = plt.subplots(figsize=(5, 5))
@@ -232,7 +601,7 @@ async def _send_list_stats(message, list_code: str):
     wedges, texts, autotexts = ax.pie(
         sizes,
         labels=labels,
-        colors=colors,  # <<< ВАЖНО: цвета совпадают с caption
+        colors=colors,  # цвета синхронизированы с caption
         autopct=lambda pct: f"{pct:.1f}%",
         explode=explode,
         startangle=90,
@@ -244,9 +613,6 @@ async def _send_list_stats(message, list_code: str):
 
     ax.set_title(f"Статистика по списку {list_code}")
     ax.axis("equal")
-
-    ax.set_title(f"Статистика по списку {list_code}")
-    ax.axis("equal")  # круг, а не овал
     plt.tight_layout()
 
     # --- сохраняем в буфер ---
@@ -261,6 +627,7 @@ async def _send_list_stats(message, list_code: str):
     caption = (
         f"📊 <b>Статистика по списку {list_code}</b>\n\n"
         f"Всего проблем: {total}\n"
+        f"⏰ Просрочено (не принято): {overdue_total}\n\n"
         f"🟡 В работе: {in_work}\n"
         f"🔵 Отправлен отчёт: {report_sent}\n"
         f"🟢 Принято: {accepted}\n"
@@ -272,7 +639,6 @@ async def _send_list_stats(message, list_code: str):
         caption=caption,
         reply_markup=admin_main_menu(),
     )
-
 
 @admin_router.callback_query(F.data == "admin:stats_problems")
 async def cb_admin_stats(call: CallbackQuery, event_from_user_role: str | None = None):

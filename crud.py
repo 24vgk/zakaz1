@@ -1,9 +1,8 @@
-
 from __future__ import annotations
 from typing import Iterable, Optional, Dict, Any
 from sqlalchemy import select, func, case
 from sqlalchemy.ext.asyncio import AsyncSession
-from models import User, Role, Problem, Report, ReportStatus, ReportMedia, MediaType, ProblemList, ProblemStatus
+from models import User, Role, Problem, Report, ReportStatus, ReportMedia, MediaType, ProblemList, ProblemStatus, Staff
 from typing import List, Tuple
 from datetime import datetime, date
 
@@ -97,7 +96,7 @@ async def upsert_problems(
     if plist is None:
         plist = ProblemList(
             code=list_code,
-            title=list_title or list_code,
+            title=list_title,
             is_closed=False,
         )
         session.add(plist)
@@ -151,7 +150,7 @@ async def get_problem_by_list_and_number(session: AsyncSession, list_code: str, 
     q = await session.execute(
         select(
             Problem.id,
-            Problem.assignee,
+            Problem.assignees_raw,
             Problem.number,
             ProblemList.is_closed,
         ).join(ProblemList)
@@ -326,3 +325,33 @@ async def get_problems_for_reminder(
         )
 
     return result
+
+
+async def upsert_staff(session: AsyncSession, rows: List[Dict[str, Any]]) -> int:
+    """
+    Обновляет/добавляет сотрудников из zakaz.xlsx.
+    Ключ — assignee (Telegram ID).
+    Возвращает количество обработанных строк.
+    """
+    processed = 0
+
+    for r in rows:
+        assignee = int(r["assignee"])
+        post = r.get("post")
+        fio = r.get("fio")
+
+        q = await session.execute(
+            select(Staff).where(Staff.assignee == assignee)
+        )
+        staff = q.scalar_one_or_none()
+
+        if staff is None:
+            staff = Staff(assignee=assignee)
+            session.add(staff)
+
+        staff.post = post
+        staff.fio = fio
+        processed += 1
+
+    await session.commit()
+    return processed

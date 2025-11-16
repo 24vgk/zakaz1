@@ -1,4 +1,6 @@
 import asyncio
+
+from aiogram.types import BotCommand
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
@@ -9,12 +11,19 @@ from db import init_db
 from handlers import user_router, admin_router, common_router
 from logging_config import setup_logging
 from middlewares.role_mw import RoleMiddleware
-from reminders import send_due_reminders
+from reminders import send_due_reminders, cb_admin_create_akt_by_staff
 import logging
 logging.basicConfig(level=logging.INFO)
 
 def ensure_token():
     if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN is not set. Put it to .env")
+
+async def setup_bot_commands(bot):
+    commands = [
+        BotCommand(command="start", description="Запустить бота"),
+        BotCommand(command="menu", description="Главное меню"),
+    ]
+    await bot.set_my_commands(commands)
 
 async def main():
     setup_logging()
@@ -22,6 +31,8 @@ async def main():
     ensure_token()
     await init_db()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+    await setup_bot_commands(bot)
 
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
@@ -34,7 +45,13 @@ async def main():
         args=[bot],
     )
 
+    scheduler.add_job(
+        cb_admin_create_akt_by_staff,
+        trigger="interval",
+        weeks=2,
+    )
     scheduler.start()
+
 
     dp = Dispatcher(storage=MemoryStorage())
     dp.message.middleware(RoleMiddleware())
