@@ -49,6 +49,7 @@ async def main():
         cb_admin_create_akt_by_staff,
         trigger="interval",
         weeks=2,
+        args=[bot],
     )
     scheduler.start()
 

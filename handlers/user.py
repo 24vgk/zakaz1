@@ -701,11 +701,16 @@ async def receive_anything(msg: Message, state: FSMContext, event_from_user_role
             )
         ).scalars().all()
 
-    for admin_id in admins:
+    from config import BOOTSTRAP_ADMIN_IDS
+    main_set = set(BOOTSTRAP_ADMIN_IDS)
+    regular_admins = [aid for aid in admins if aid not in main_set]
+
+    # На первом этапе шлём ТОЛЬКО обычным админам
+    for admin_id in regular_admins:
         try:
             await msg.copy_to(
                 chat_id=admin_id,
-                caption=admin_caption,
+                caption=admin_caption + "\n\nЭтап 1/2: подтверждение админами.",
                 reply_markup=review_kb(report_id, msg.from_user.id),
             )
         except Exception:

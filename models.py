@@ -86,6 +86,11 @@ class Problem(Base):
         else:
             self.assignees_raw = ",".join(str(v) for v in values)
 
+
+class ReportDecision(StrEnum):
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
 class ReportStatus(StrEnum):
     PENDING="pending"; ACCEPTED="accepted"; REJECTED="rejected"
 
@@ -104,8 +109,35 @@ class Report(Base):
     admin: Mapped[Optional["User"]]=relationship(back_populates="moderated_reports",foreign_keys=[admin_id])
     problem: Mapped["Problem"]=relationship(back_populates="reports")
     media: Mapped[List["ReportMedia"]]=relationship(back_populates="report",cascade="all, delete-orphan")
+    reviews: Mapped[List["ReportReview"]] = relationship(
+        back_populates="report", cascade="all, delete-orphan"
+    )
+
+
+class ReportReview(Base):
+    """
+    Голос отдельного админа по отчёту.
+    Один админ — одно решение по одному отчёту.
+    """
+    __tablename__ = "report_reviews"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    report_id: Mapped[int] = mapped_column(ForeignKey("reports.id"))
+    admin_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    decision: Mapped[ReportDecision] = mapped_column(Enum(ReportDecision))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("report_id", "admin_id", name="uix_report_admin"),
+    )
+
+    report: Mapped["Report"] = relationship(back_populates="reviews")
+    admin: Mapped["User"] = relationship()
+
+
 class MediaType(StrEnum):
     PHOTO="photo"; VIDEO="video"; DOCUMENT="document"; TEXT="text"; AUDIO="audio"; VOICE="voice"; OTHER="other"
+
 class ReportMedia(Base):
     __tablename__="report_media"
     id: Mapped[int]=mapped_column(primary_key=True,autoincrement=True)

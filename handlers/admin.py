@@ -11,13 +11,18 @@ from aiogram.types import Message, CallbackQuery, BufferedInputFile, InlineKeybo
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import BaseFilter
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func, or_, delete
 from docx import Document
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from config import GROUP_CHAT_ID
 from db import session_scope
 from crud import upsert_problems, set_report_status, problems_stats, set_admin, set_problem_status, \
-    close_list_if_completed, upsert_staff
-from models import ReportStatus, Report, ProblemStatus, Problem, ProblemList, Role, User, Staff, ActEntry
+    close_list_if_completed, upsert_staff, all_regular_approved, get_admin_ids, split_admins, upsert_review, \
+    has_any_rejection
+from keyboards.admin_kb import review_kb
+from models import ReportStatus, Report, ProblemStatus, Problem, ProblemList, Role, User, Staff, ActEntry, \
+    ReportDecision, ReportReview
 from utils.parsing import parse_problems_csv, parse_problems_xlsx
 
 from keyboards.admin_main_kb import admin_main_menu
@@ -46,6 +51,65 @@ async def guard_admin(call_or_msg, event_from_user_role: str | None) -> bool:
             await call_or_msg.answer(text)
         return False
     return True
+
+
+async def build_votes_summary(session: AsyncSession, report_id: int) -> str:
+    """
+    Возвращает текст вида:
+      👥 Голоса админов:
+      - Иван (обычный): ✅ Принял
+      - Пётр (главный): ⏳ Нет голоса
+    """
+    all_admin_ids = await get_admin_ids(session)
+    regular_ids, main_ids = split_admins(all_admin_ids)
+
+    if not all_admin_ids:
+        return ""
+
+    # грузим всех админов
+    rows = await session.execute(
+        select(User).where(User.id.in_(all_admin_ids))
+    )
+    admins: list[User] = list(rows.scalars().all())
+    admin_by_id = {u.id: u for u in admins}
+
+    # грузим все решения по отчёту
+    rows2 = await session.execute(
+        select(ReportReview).where(ReportReview.report_id == report_id)
+    )
+    reviews: list[ReportReview] = list(rows2.scalars().all())
+    decision_by_admin: dict[int, ReportDecision] = {
+        r.admin_id: r.decision for r in reviews
+    }
+
+    # имя пользователя
+    def short_name(u: User) -> str:
+        if u.first_name or u.last_name:
+            return f"{u.first_name or ''} {u.last_name or ''}".strip()
+        if u.username:
+            return f"@{u.username}"
+        return str(u.id)
+
+    lines: list[str] = ["\n👥 Голоса админов:"]
+
+    for aid in all_admin_ids:
+        u = admin_by_id.get(aid)
+        if not u:
+            continue
+
+        role_label = "главный" if aid in main_ids else "обычный"
+        dec = decision_by_admin.get(aid)
+
+        if dec == ReportDecision.APPROVED:
+            mark = "✅ Принял"
+        elif dec == ReportDecision.REJECTED:
+            mark = "❌ Отклонил"
+        else:
+            mark = "⏳ Нет голоса"
+
+        lines.append(f"- {short_name(u)} ({role_label}): {mark}")
+
+    return "\n".join(lines)
 
 class AdminStates(StatesGroup):
     waiting_list_code = State()
@@ -747,121 +811,245 @@ async def del_admin_receive_id(msg: Message, state: FSMContext):
 
 # ===== Модерация отчётов (кнопки уже были) =====
 @admin_router.callback_query(F.data.startswith("admin:accept:"))
-async def cb_accept(call: CallbackQuery, event_from_user_role: str | None = None):
+async def cb_accept(
+    call: CallbackQuery,
+    event_from_user_role: str | None = None,
+):
     if not await guard_admin(call, event_from_user_role):
         return
 
-    # данные из callback_data: admin:accept:<report_id>:<user_id>
-    _, _, report_id_s, user_id_s = call.data.split(":", 3)
-    report_id = int(report_id_s)
-    user_id = int(user_id_s)
+    try:
+        _, _, report_id_s, user_tg_s = call.data.split(":", 3)
+        report_id = int(report_id_s)
+        user_tg_id = int(user_tg_s)
+    except Exception:
+        await call.answer("Некорректные данные кнопки.", show_alert=True)
+        return
 
-    # === 1. Обновляем отчёт и проблему ===
+    admin_tg_id = call.from_user.id
+
     async with session_scope() as s:
-        rep = await s.get(Report, report_id)
-        if not rep:
-            await call.answer("Ошибка: отчёт не найден.", show_alert=True)
+        report = await s.get(Report, report_id)
+        if not report:
+            await call.answer("Отчёт не найден.", show_alert=True)
             return
 
-        # Обновляем отчёт
-        rep.status = ReportStatus.ACCEPTED
-        rep.admin_id = call.from_user.id
-        rep.admin_reason = None
+        problem = await s.get(Problem, report.problem_id)
 
-        # Обновляем связанную проблему
-        problem = await s.get(Problem, rep.problem_id)
-        if problem:
-            problem.status = ProblemStatus.ACCEPTED
-            problem.note = None
+        all_admin_ids = await get_admin_ids(s)
+        regular_ids, main_ids = split_admins(all_admin_ids)
+
+        # фиксируем, что этот админ одобрил
+        await upsert_review(s, report_id, admin_tg_id, ReportDecision.APPROVED)
+
+        # если уже кто-то отклонил — не даём принять
+        if await has_any_rejection(s, report_id):
+            await s.commit()
+            await call.answer("По этому отчёту уже есть отклонение.", show_alert=True)
+            return
+
+        # === если это главный (этап 2/2) ===
+        if admin_tg_id in main_ids:
+            report.status = ReportStatus.ACCEPTED
+            if problem:
+                problem.status = ProblemStatus.ACCEPTED
+                problem.note = None
+            report.admin_id = admin_tg_id
+
+            await s.commit()
+
+            # юзеру
+            try:
+                await call.bot.send_message(
+                    chat_id=user_tg_id,
+                    text="✅ Ваш отчёт по задаче принят.",
+                )
+            except Exception:
+                pass
+
+            # собираем сводку голосов
+            votes_text = await build_votes_summary(s, report_id)
+
+            # убираем кнопки на этом сообщении и дописываем статус + голоса
+            try:
+                base = call.message.caption or call.message.text or ""
+                new_text = base + "\n\n✅ Окончательно принято." + votes_text
+                if call.message.caption is not None:
+                    await call.message.edit_caption(new_text, reply_markup=None)
+                else:
+                    await call.message.edit_text(new_text, reply_markup=None)
+            except Exception:
+                pass
+
+            await call.answer("Отчёт окончательно принят ✅")
+            return
+
+        # === обычный админ (этап 1/2) ===
+        # если все обычные одобрили — шлём главным
+        if await all_regular_approved(s, report_id, regular_ids):
+            for mid in main_ids:
+                try:
+                    await call.bot.copy_message(
+                        chat_id=mid,
+                        from_chat_id=report.user_chat_id,
+                        message_id=report.user_msg_id,
+                        caption=(
+                            f"Новый отчёт #{report.id} (этап 2/2)\n"
+                            f"Все обычные админы его одобрили.\n\n"
+                            f"Нажмите, чтобы принять или отклонить."
+                        ),
+                        reply_markup=review_kb(report.id, user_tg_id),
+                    )
+                except Exception:
+                    pass
 
         await s.commit()
 
-    # === 2. Уведомляем пользователя ===
-    try:
-        await call.bot.send_message(user_id, "Ваш отчёт принят!")
-    except Exception:
-        pass
+        # обновляем текст у ТЕКУЩЕГО админа (его копии) — статус + голоса
+        try:
+            votes_text = await build_votes_summary(s, report_id)
+            suffix = "\n\n✅ Ваш голос 'Принять' учтён." + votes_text
+            base = call.message.caption or call.message.text or ""
+            new_text = base + suffix
 
-    # === 3. Пытаемся обновить сообщение у администратора ===
-    new_text = None
-    if call.message.caption:
-        new_text = call.message.caption + "\n\n✅ Принято"
-    elif call.message.text:
-        new_text = call.message.text + "\n\n✅ Принято"
-
-    try:
-        if new_text:
-            if call.message.caption:
+            if call.message.caption is not None:
                 await call.message.edit_caption(new_text, reply_markup=None)
             else:
                 await call.message.edit_text(new_text, reply_markup=None)
-        else:
-            # если вдруг нет ни текста, ни подписи — хотя бы убираем кнопки
-            await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramBadRequest:
-        # сюда как раз прилетает "business connection not found" и подобное
-        await call.message.answer("✅ Отчёт принят", reply_markup=admin_main_menu())
+        except Exception:
+            pass
 
-    await call.answer("Готово")
+    await call.answer("Ваше одобрение учтено ✅")
 
 @admin_router.callback_query(F.data.startswith("admin:reject:"))
-async def cb_reject(call: CallbackQuery, state: FSMContext, event_from_user_role: str | None = None):
+async def cb_reject_start(
+    call: CallbackQuery,
+    state: FSMContext,
+    event_from_user_role: str | None = None,
+):
     if not await guard_admin(call, event_from_user_role):
         return
 
-    # admin:reject:<report_id>:<user_id>
-    _, _, report_id_s, user_id_s = call.data.split(":", 3)
-    await state.update_data(report_id=int(report_id_s), user_id=int(user_id_s))
+    try:
+        _, _, report_id_s, user_tg_s = call.data.split(":", 3)
+        report_id = int(report_id_s)
+        user_tg_id = int(user_tg_s)
+    except Exception:
+        await call.answer("Некорректные данные кнопки.", show_alert=True)
+        return
 
+    # сохраняем контекст в FSM
+    await state.update_data(
+        reject_report_id=report_id,
+        reject_user_tg_id=user_tg_id,
+        reject_message_chat_id=call.message.chat.id,
+        reject_message_id=call.message.message_id,
+    )
     await state.set_state(AdminStates.waiting_reject_reason)
-    await call.message.answer("Введите причину отклонения отчёта:")
+
+    await call.message.answer(
+        "❌ Вы собираетесь отклонить отчёт.\n"
+        "Пожалуйста, введите причину отклонения одним сообщением."
+    )
     await call.answer()
 
 @admin_router.message(AdminStates.waiting_reject_reason)
-async def admin_reject_reason(msg: Message, state: FSMContext, event_from_user_role: str | None = None):
+async def cb_reject_reason(
+    msg: Message,
+    state: FSMContext,
+    event_from_user_role: str | None = None,
+):
     if not await guard_admin(msg, event_from_user_role):
         await state.clear()
         return
 
     data = await state.get_data()
-    report_id = int(data["report_id"])
-    user_id = int(data["user_id"])
-    reason = (msg.text or "").strip() or "Без объяснения"
+    report_id = int(data.get("reject_report_id"))
+    user_tg_id = int(data.get("reject_user_tg_id"))
+    msg_chat_id = data.get("reject_message_chat_id")
+    msg_id = data.get("reject_message_id")
 
-    # === 1. Обновляем отчёт и проблему ===
+    reason = (msg.text or "").strip()
+    if not reason:
+        await msg.answer("Причина не может быть пустой. Попробуйте ещё раз или /cancel.")
+        return
+
+    admin_tg_id = msg.from_user.id
+
     async with session_scope() as s:
-        rep = await s.get(Report, report_id)
-        if not rep:
-            await msg.answer("Ошибка: отчёт не найден.")
+        report = await s.get(Report, report_id)
+        if not report:
+            await msg.answer("Отчёт не найден.", reply_markup=admin_main_menu())
             await state.clear()
             return
 
-        rep.status = ReportStatus.REJECTED
-        rep.admin_id = msg.from_user.id
-        rep.admin_reason = reason
+        problem = await s.get(Problem, report.problem_id)
 
-        problem = await s.get(Problem, rep.problem_id)
+        # фиксируем REJECT
+        await upsert_review(s, report_id, admin_tg_id, ReportDecision.REJECTED)
+
+        # отчёт и задача сразу в REJECTED
+        report.status = ReportStatus.REJECTED
+        report.admin_id = admin_tg_id
+        report.admin_reason = reason
+
         if problem:
             problem.status = ProblemStatus.REJECTED
             problem.note = reason
 
         await s.commit()
 
-    # === 2. Уведомляем пользователя ===
+        # уведомляем исполнителя
+        try:
+            text = (
+                "❌ Ваш отчёт отклонён. Задача отправлена на доработку.\n"
+                f"Причина: {reason}"
+            )
+            await msg.bot.send_message(
+                chat_id=user_tg_id,
+                text=text,
+            )
+        except Exception:
+            pass
+
+        # для красоты — получим сводку голосов
+        votes_text = await build_votes_summary(s, report_id)
+
+    # обновляем подпись/текст у исходного сообщения с отчётом (у этого админа)
     try:
-        await msg.bot.send_message(
-            chat_id=user_id,
-            text=f"Ваш отчёт отклонён со следующей формулировкой:\n{reason}",
-        )
+        if msg_chat_id and msg_id:
+            # подтягиваем сообщение через bot.edit...
+            from aiogram.exceptions import TelegramBadRequest
+
+            try:
+                await msg.bot.edit_message_caption(
+                    chat_id=msg_chat_id,
+                    message_id=msg_id,
+                    caption=(
+                        f"Отчёт #{report_id}\n\n"
+                        f"❌ Отклонён. Задача на доработку.\n"
+                        f"Причина: {reason}"
+                        f"{votes_text}"
+                    ),
+                    reply_markup=None,
+                )
+            except TelegramBadRequest:
+                # если не было подписи — пробуем текстом
+                await msg.bot.edit_message_text(
+                    chat_id=msg_chat_id,
+                    message_id=msg_id,
+                    text=(
+                        f"Отчёт #{report_id}\n\n"
+                        f"❌ Отклонён. Задача на доработку.\n"
+                        f"Причина: {reason}"
+                        f"{votes_text}"
+                    ),
+                    reply_markup=None,
+                )
     except Exception:
         pass
 
-    # === 3. Сообщение админу (просто отправим новое, не редактируя старое) ===
-    await msg.answer(
-        f"Отчёт #{report_id} отклонён.\nПричина: {reason}",
-        reply_markup=admin_main_menu(),
-    )
-
+    await msg.answer("❌ Отчёт отклонён. Причина сохранена.", reply_markup=admin_main_menu())
     await state.clear()
 
 
@@ -927,3 +1115,198 @@ async def cb_admin_users(call: CallbackQuery, event_from_user_role: str | None =
         await call.message.answer(text, reply_markup=kb)
 
     await call.answer()
+
+
+# ===== Удаление списков проблем =====
+
+@admin_router.callback_query(F.data == "admin:delete_plists")
+async def cb_admin_delete_plists(
+    call: CallbackQuery,
+    event_from_user_role: str | None = None,
+):
+    """Показать список всех списков проблем для выбора удаления."""
+    if not await guard_admin(call, event_from_user_role):
+        return
+
+    async with session_scope() as s:
+        rows = await s.execute(
+            select(
+                ProblemList.id,
+                ProblemList.code,
+                ProblemList.title,
+                ProblemList.is_closed,
+                func.count(Problem.id).label("cnt"),
+            )
+            .join(Problem, Problem.list_id == ProblemList.id, isouter=True)
+            .group_by(ProblemList.id, ProblemList.code, ProblemList.title, ProblemList.is_closed)
+            .order_by(ProblemList.code)
+        )
+        items = rows.all()
+
+    if not items:
+        await call.message.edit_text(
+            "Списков проблем пока нет.",
+            reply_markup=admin_main_menu(),
+        )
+        await call.answer()
+        return
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for pid, code, title, is_closed, cnt in items:
+        title_display = title or "(без названия)"
+        status = "✅ закрыт" if is_closed else "🟢 открыт"
+        text = f"{code} — {title_display} ({cnt} задач, {status})"
+        kb_rows.append([
+            InlineKeyboardButton(
+                text=text,
+                callback_data=f"admin:del_plist:{code}",
+            )
+        ])
+
+    kb_rows.append([
+        InlineKeyboardButton(
+            text="⬅️ Назад в меню",
+            callback_data="admin:back_main",
+        )
+    ])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    await call.message.edit_text(
+        "Выберите список проблем, который нужно удалить.\n"
+        "⚠️ <b>Вместе со списком будут удалены все его задачи.</b>",
+        reply_markup=kb,
+    )
+    await call.answer()
+
+
+@admin_router.callback_query(F.data.startswith("admin:del_plist:"))
+async def cb_admin_del_plist_confirm(
+    call: CallbackQuery,
+    event_from_user_role: str | None = None,
+):
+    """Подтверждение удаления выбранного списка проблем."""
+    if not await guard_admin(call, event_from_user_role):
+        return
+
+    try:
+        _, _, list_code = call.data.split(":", 2)
+    except Exception:
+        await call.answer("Некорректные данные кнопки.", show_alert=True)
+        return
+
+    async with session_scope() as s:
+        row = await s.execute(
+            select(
+                ProblemList,
+                func.count(Problem.id).label("cnt"),
+            )
+            .join(Problem, Problem.list_id == ProblemList.id, isouter=True)
+            .where(ProblemList.code == list_code)
+            .group_by(ProblemList.id)
+        )
+        res = row.first()
+
+    if not res:
+        await call.message.edit_text(
+            f"Список с кодом <b>{list_code}</b> не найден.",
+            reply_markup=admin_main_menu(),
+        )
+        await call.answer()
+        return
+
+    plist, cnt = res
+    title = plist.title or "(без названия)"
+    status = "закрыт" if plist.is_closed else "открыт"
+
+    text = (
+        f"Вы собираетесь удалить список проблем:\n\n"
+        f"<b>Код:</b> {plist.code}\n"
+        f"<b>Название:</b> {title}\n"
+        f"<b>Статус:</b> {status}\n"
+        f"<b>Количество задач:</b> {cnt}\n\n"
+        f"⚠️ <b>Все задачи этого списка будут удалены безвозвратно.</b>\n\n"
+        f"Продолжить?"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="✅ Да, удалить",
+                callback_data=f"admin:del_plist_do:{plist.code}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="⬅️ Отмена",
+                callback_data="admin:delete_plists",  # вернёмся к выбору списков
+            )
+        ],
+    ])
+
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
+
+@admin_router.callback_query(F.data.startswith("admin:del_plist_do:"))
+async def cb_admin_del_plist_do(
+    call: CallbackQuery,
+    event_from_user_role: str | None = None,
+):
+    """Удаляет список проблем и все его задачи (без ленивых загрузок)."""
+    if not await guard_admin(call, event_from_user_role):
+        return
+
+    try:
+        _, _, list_code = call.data.split(":", 2)
+    except Exception:
+        await call.answer("Некорректные данные кнопки.", show_alert=True)
+        return
+
+    async with session_scope() as s:
+        # 1) найдём список
+        row = await s.execute(
+            select(ProblemList.id, ProblemList.code, ProblemList.title)
+            .where(ProblemList.code == list_code)
+        )
+        plist_row = row.first()
+
+        if not plist_row:
+            await call.message.edit_text(
+                f"Список с кодом <b>{list_code}</b> уже не существует.",
+                reply_markup=admin_main_menu(),
+            )
+            await call.answer()
+            return
+
+        plist_id, code, title = plist_row
+        title = title or "(без названия)"
+
+        # 2) посчитаем количество задач в этом списке
+        q_cnt = await s.execute(
+            select(func.count(Problem.id)).where(Problem.list_id == plist_id)
+        )
+        problems_count = q_cnt.scalar_one() or 0
+
+        # 3) сначала удаляем задачи этого списка
+        await s.execute(
+            delete(Problem).where(Problem.list_id == plist_id)
+        )
+        # 4) затем удаляем сам список
+        await s.execute(
+            delete(ProblemList).where(ProblemList.id == plist_id)
+        )
+
+        await s.commit()
+
+    text = (
+        f"🗑 Список проблем <b>{code}</b> ({title}) удалён.\n"
+        f"Удалено задач: {problems_count}."
+    )
+
+    try:
+        await call.message.edit_text(text, reply_markup=admin_main_menu())
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
+
+    await call.answer("Список удалён ✅", show_alert=False)

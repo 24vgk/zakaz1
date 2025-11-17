@@ -2,7 +2,10 @@ from __future__ import annotations
 from typing import Iterable, Optional, Dict, Any
 from sqlalchemy import select, func, case
 from sqlalchemy.ext.asyncio import AsyncSession
-from models import User, Role, Problem, Report, ReportStatus, ReportMedia, MediaType, ProblemList, ProblemStatus, Staff
+
+from config import BOOTSTRAP_ADMIN_IDS
+from models import User, Role, Problem, Report, ReportStatus, ReportMedia, MediaType, ProblemList, ProblemStatus, Staff, \
+    ReportDecision, ReportReview
 from typing import List, Tuple
 from datetime import datetime, date
 
@@ -355,3 +358,93 @@ async def upsert_staff(session: AsyncSession, rows: List[Dict[str, Any]]) -> int
 
     await session.commit()
     return processed
+
+#____________CRUD-утилиты для голосов
+
+async def get_admin_ids(session: AsyncSession) -> list[int]:
+    rows = await session.execute(
+        select(User.id).where(User.role == Role.ADMIN)
+    )
+    return list(rows.scalars().all())
+
+
+def split_admins(all_ids: list[int]) -> tuple[set[int], set[int]]:
+    """
+    Возвращает (regular_admins, main_admins)
+    """
+    main = set(BOOTSTRAP_ADMIN_IDS)
+    all_set = set(all_ids)
+    main_real = all_set & main
+    regular = all_set - main_real
+    return regular, main_real
+
+
+async def upsert_review(
+    session: AsyncSession,
+    report_id: int,
+    admin_tg_id: int,
+    decision: ReportDecision,
+) -> None:
+    row = await session.execute(
+        select(ReportReview).where(
+            ReportReview.report_id == report_id,
+            ReportReview.admin_id == admin_tg_id,
+        )
+    )
+    rr = row.scalar_one_or_none()
+    if rr is None:
+        rr = ReportReview(
+            report_id=report_id,
+            admin_id=admin_tg_id,
+            decision=decision,
+        )
+        session.add(rr)
+    else:
+        rr.decision = decision
+
+
+async def has_any_rejection(session: AsyncSession, report_id: int) -> bool:
+    q = await session.execute(
+        select(ReportReview.id).where(
+            ReportReview.report_id == report_id,
+            ReportReview.decision == ReportDecision.REJECTED,
+        )
+    )
+    return q.scalar_one_or_none() is not None
+
+
+async def all_regular_approved(
+    session: AsyncSession,
+    report_id: int,
+    regular_ids: set[int],
+) -> bool:
+    """
+    Возвращает True, если все обычные админы из regular_ids
+    проголосовали APPROVED и нет REJECTED.
+    """
+    if not regular_ids:
+        return True
+
+    # кто из обычных админов голосовал approved
+    rows = await session.execute(
+        select(ReportReview.admin_id).where(
+            ReportReview.report_id == report_id,
+            ReportReview.admin_id.in_(regular_ids),
+            ReportReview.decision == ReportDecision.APPROVED,
+        )
+    )
+    approved = set(rows.scalars().all())
+
+    if approved != regular_ids:
+        return False
+
+    # проверяем, нет ли среди них reject
+    rows2 = await session.execute(
+        select(ReportReview.admin_id).where(
+            ReportReview.report_id == report_id,
+            ReportReview.admin_id.in_(regular_ids),
+            ReportReview.decision == ReportDecision.REJECTED,
+        )
+    )
+    rejected = set(rows2.scalars().all())
+    return len(rejected) == 0
